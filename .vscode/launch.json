@@ -74,7 +74,7 @@
             "program": "src/exp.py",
             "console": "integratedTerminal",
             "args": [
-                "finetune2", "--task=qnli", "--filter-method=infl", "--infl-method=hf", "--num-epochs=1", "--module-pattern=.*\\.layer\\.0\\..*\\.lora_(A|B)\\..*"
+                "finetune2", "--task=qnli", "--filter-method=denoise", "--infl-method=", "--num-epochs=4", "--module-pattern=.*\\.layer\\.0\\..*\\.lora_(A|B)\\..*"
             ],
             "env": {
                 "INFL_SEED": "0",

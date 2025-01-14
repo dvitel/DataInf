@@ -1,8 +1,11 @@
+from collections import defaultdict
 from tqdm import tqdm
 import pickle
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from torch.nn import CrossEntropyLoss
+import torch.autograd.functional as F
 from transformers import (
     AutoModelForSequenceClassification, AutoModel,
     get_linear_schedule_with_warmup,
@@ -97,12 +100,68 @@ def train_LORA_model(model,
         model.train()
         for step, batch in enumerate(tqdm(train_dataloader)):
             batch.to(device)
+            model.zero_grad()
             outputs = model(**batch)
             loss = outputs.loss
             loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
+            loss_grads = {nm: pvalue.grad.clone() for nm, pvalue in model.named_parameters() if "lora" in nm}
+            # optimizer.step()
+            # lr_scheduler.step()
             optimizer.zero_grad()
+
+            # if epoch == 3:
+            outputs = model(**batch) # another forward pass
+
+            # loss2_fn = CrossEntropyLoss(reduction='none')
+            # loss2 = loss2_fn(outputs.logits, batch["labels"])
+
+            def compute_loss_func(_params, _batch):
+                _output = torch.func.functional_call(model, _params, (), kwargs=_batch)
+                _loss = torch.nn.functional.cross_entropy(_output.logits, _batch['labels'], reduction='none')
+                return _loss
+
+            loss2_jac_fn = torch.func.jacrev(compute_loss_func, has_aux=False)
+
+            loss2_grads = loss2_jac_fn({nm:pval for nm, pval in model.named_parameters() if 'lora' in nm}, batch)
+
+
+            # loss2_grads = {nm: torch.zeros((len(loss2), *pvalue.shape), device = loss2.device) for nm, pvalue in model.named_parameters() if "lora" in nm}
+            # for i in range(len(loss2)):
+            #     filter_v = torch.zeros_like(loss2)
+            #     filter_v[i] = 1
+            #     model.zero_grad()
+            #     loss2.backward(gradient = filter_v, retain_graph = True)
+            #     for nm, pvalue in model.named_parameters():
+            #         if "lora" in nm:
+            #             loss2_grads[nm][i] = pvalue.grad
+
+            for nm, loss_grad in loss_grads.items():
+                loss2_grad = loss2_grads[nm]
+                loss2_grad_mean = torch.mean(loss2_grad, dim=0)
+                loss2_grad_sum = torch.sum(loss2_grad, dim=0)
+                l1 = loss2_grad.reshape(loss2_grad.shape[0], -1)
+                l2 = l1.unsqueeze(1)
+                l3 = l1.unsqueeze(0)
+                cos_sim = torch.nn.functional.cosine_similarity(l2, l3, dim=-1)
+                zero_diag = 1 - torch.eye(cos_sim.shape[0], device=cos_sim.device)
+                directions = zero_diag * (cos_sim > 0)
+                print(loss_grad, loss2_grad)
+            # def loss2_func(params):
+            #     return loss2
+
+            # for nm, pvalue in model.named_parameters():
+            #     if "lora" in nm:
+            #         loss2_layer_jacobian = jacobian(loss2_func, pvalue, vectorize=True)
+            #         jacobian_mean = torch.mean(loss2_layer_jacobian, dim=0)
+            #         jacobian_sum = torch.sum(loss2_layer_jacobian,  dim=0)
+            #         loss_grad = loss_grads[nm]
+            #         pass
+            # def compute_loss2(params):
+            #     loss2 = loss2_fn(outputs.logits, batch["labels"])
+            #     return loss2
+            # loss2_jacobian = jacobian(compute_loss2, outputs.logits)
+            # print(loss2_grads)
+            pass
 
         model.eval()
         for step, batch in enumerate(tqdm(eval_dataloader)):
