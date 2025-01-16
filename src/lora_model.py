@@ -1,4 +1,5 @@
 from collections import defaultdict
+import gc
 from tqdm import tqdm
 import pickle
 import torch
@@ -73,7 +74,120 @@ def load_pretrained_LORA_model(model_name_or_path):
     model.print_trainable_parameters()
     return model
 
-def train_LORA_model(model,
+def select_majority_codirected_grad_group(grad_tensor, module_name):
+    ''' For each grad vector finds a group of other grads of same direction
+        Selects the grad with biggest number of co-directional grads and for it group computes grad mean  
+    '''
+    grad_tensor_flat = grad_tensor.view(grad_tensor.size(0), -1)
+    grad_tensor_flat_1 = grad_tensor_flat.unsqueeze(1)
+    grad_tensor_flat_2 = grad_tensor_flat.unsqueeze(0)
+    cos_sim_matrix = torch.nn.functional.cosine_similarity(grad_tensor_flat_1, grad_tensor_flat_2, dim=-1)
+    codirectional = 0 + (cos_sim_matrix > 0)
+    sample_scores = torch.sum(codirectional, dim=1)
+    best_sample = torch.argmax(sample_scores)
+    best_sample_group = torch.where(codirectional[best_sample] > 0)[0]
+    best_sample_group_grads = grad_tensor[best_sample_group]
+    if len(best_sample_group_grads) == 0:
+        grad_vector = grad_tensor[best_sample].clone()
+    else:
+        grad_vector = torch.mean(best_sample_group_grads, dim=0)
+
+    del grad_tensor_flat, grad_tensor_flat_1, grad_tensor_flat_2, cos_sim_matrix, codirectional, sample_scores, best_sample_group, best_sample_group_grads
+    return grad_vector
+
+def get_pareto_front_indexes(fitnesses):
+    ''' Get the pareto front indexes from a tensor. 
+        NOTE: greater is better here. Invert your fitness if it is the opposite.
+    '''
+    unsq = fitnesses.unsqueeze(-1) 
+    domination_matrix = torch.all(unsq <= fitnesses, axis=2) & torch.any(unsq < fitnesses, axis=2)
+    indexes = torch.where(~torch.any(domination_matrix, axis=1))[0]
+    return indexes
+
+def select_pareto_magnitude_grad(grad_tensor, module_name):
+    """ Selects those grads that have biggest change for weights 
+        Note that Pareto is taken on abs values of grads, but grads could be not codirected and compensate each other
+    """
+    grad_tensor_flat = grad_tensor.view(grad_tensor.size(0), -1)
+    grad_tensor_flat_abs = torch.abs(grad_tensor_flat)
+    pareto_front_indexes = get_pareto_front_indexes(grad_tensor_flat_abs)
+    pareto_front = grad_tensor[pareto_front_indexes]
+    grad_vector = torch.mean(pareto_front, dim=0)
+    return grad_vector
+
+def selective_train(grad_selection, model,
+        train_dataloader=None,
+        eval_dataloader=None,
+        device="cuda",
+        num_epochs=10,
+        lr=3e-4,
+        task="mrpc"):
+    '''
+    A game-like train-sample vs weight competition. 
+    Interraction matrix is tensor of gradients (a.k.a. Jacobian) of the loss function w.r.t. the model's weights on batch
+    '''
+    metric = evaluate.load("glue", task)
+    optimizer = AdamW(params=model.parameters(), lr=lr)
+
+    # Instantiate scheduler
+    lr_scheduler = get_linear_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=0.06*(len(train_dataloader)*num_epochs),
+        num_training_steps=(len(train_dataloader)*num_epochs),
+    )
+
+    model.to(device)
+    eval_metrics = []
+
+    def compute_loss_func(params, batch):
+        labels = batch.pop("labels")
+        output = torch.func.functional_call(model, params, (), kwargs=batch)
+        loss = torch.nn.functional.cross_entropy(output.logits, labels, reduction='none')
+        return loss
+
+    loss2_jac_fn = torch.func.jacrev(compute_loss_func, has_aux=False)
+    trainable_params = {nm:pval for nm, pval in model.named_parameters() if pval.requires_grad}
+
+    for epoch in range(num_epochs):
+        model.train()
+        for step, batch in enumerate(tqdm(train_dataloader)):
+            batch.to(device)
+            # labels = batch.pop("labels")
+            
+            with torch.no_grad():
+                loss2_jacobian = loss2_jac_fn(trainable_params, batch)
+            
+            for nm, pval in trainable_params.items():
+                grad_tensor = grad_selection(loss2_jacobian[nm], module_name = nm)
+                pval.grad = grad_tensor # setting gradients
+
+            # del loss2_jacobian
+            
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+            # gc.collect()
+            # print(f"Memory Summary:\n{torch.cuda.memory_summary()}")
+
+        model.eval()
+        for step, batch in enumerate(tqdm(eval_dataloader)):
+            batch.to(device)
+            with torch.no_grad():
+                outputs = model(**batch)
+            predictions = outputs.logits.argmax(dim=-1)
+            predictions, references = predictions, batch["labels"]
+            metric.add_batch(
+                predictions=predictions,
+                references=references,
+            )
+
+        eval_metric = metric.compute()
+        print(f"Epoch {(epoch+1)}:", eval_metric)
+        eval_metrics.append(eval_metric)
+    return eval_metrics
+
+
+def train_model(model,
         train_dataloader=None,
         eval_dataloader=None,
         device="cuda",
@@ -100,68 +214,12 @@ def train_LORA_model(model,
         model.train()
         for step, batch in enumerate(tqdm(train_dataloader)):
             batch.to(device)
-            model.zero_grad()
             outputs = model(**batch)
             loss = outputs.loss
             loss.backward()
-            loss_grads = {nm: pvalue.grad.clone() for nm, pvalue in model.named_parameters() if "lora" in nm}
-            # optimizer.step()
-            # lr_scheduler.step()
+            optimizer.step()
+            lr_scheduler.step()
             optimizer.zero_grad()
-
-            # if epoch == 3:
-            outputs = model(**batch) # another forward pass
-
-            # loss2_fn = CrossEntropyLoss(reduction='none')
-            # loss2 = loss2_fn(outputs.logits, batch["labels"])
-
-            def compute_loss_func(_params, _batch):
-                _output = torch.func.functional_call(model, _params, (), kwargs=_batch)
-                _loss = torch.nn.functional.cross_entropy(_output.logits, _batch['labels'], reduction='none')
-                return _loss
-
-            loss2_jac_fn = torch.func.jacrev(compute_loss_func, has_aux=False)
-
-            loss2_grads = loss2_jac_fn({nm:pval for nm, pval in model.named_parameters() if 'lora' in nm}, batch)
-
-
-            # loss2_grads = {nm: torch.zeros((len(loss2), *pvalue.shape), device = loss2.device) for nm, pvalue in model.named_parameters() if "lora" in nm}
-            # for i in range(len(loss2)):
-            #     filter_v = torch.zeros_like(loss2)
-            #     filter_v[i] = 1
-            #     model.zero_grad()
-            #     loss2.backward(gradient = filter_v, retain_graph = True)
-            #     for nm, pvalue in model.named_parameters():
-            #         if "lora" in nm:
-            #             loss2_grads[nm][i] = pvalue.grad
-
-            for nm, loss_grad in loss_grads.items():
-                loss2_grad = loss2_grads[nm]
-                loss2_grad_mean = torch.mean(loss2_grad, dim=0)
-                loss2_grad_sum = torch.sum(loss2_grad, dim=0)
-                l1 = loss2_grad.reshape(loss2_grad.shape[0], -1)
-                l2 = l1.unsqueeze(1)
-                l3 = l1.unsqueeze(0)
-                cos_sim = torch.nn.functional.cosine_similarity(l2, l3, dim=-1)
-                zero_diag = 1 - torch.eye(cos_sim.shape[0], device=cos_sim.device)
-                directions = zero_diag * (cos_sim > 0)
-                print(loss_grad, loss2_grad)
-            # def loss2_func(params):
-            #     return loss2
-
-            # for nm, pvalue in model.named_parameters():
-            #     if "lora" in nm:
-            #         loss2_layer_jacobian = jacobian(loss2_func, pvalue, vectorize=True)
-            #         jacobian_mean = torch.mean(loss2_layer_jacobian, dim=0)
-            #         jacobian_sum = torch.sum(loss2_layer_jacobian,  dim=0)
-            #         loss_grad = loss_grads[nm]
-            #         pass
-            # def compute_loss2(params):
-            #     loss2 = loss2_fn(outputs.logits, batch["labels"])
-            #     return loss2
-            # loss2_jacobian = jacobian(compute_loss2, outputs.logits)
-            # print(loss2_grads)
-            pass
 
         model.eval()
         for step, batch in enumerate(tqdm(eval_dataloader)):

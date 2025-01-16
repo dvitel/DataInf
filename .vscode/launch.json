@@ -40,6 +40,20 @@
             }
         },
         {
+            "name": "Fitetune Selective: GLUE QNLI on DistilRoberta",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "src/exp.py",
+            "console": "integratedTerminal",
+            "args": [
+                "finetune-selective", "--task=qnli", "--model=distilbert/distilroberta-base", "--num-epochs=2"
+            ],
+            "env": {
+                "INFL_SEED": "0",
+                "INFL_CWD": "./data/dev"
+            }
+        },        
+        {
             "name": "Grad: GLUE QNLI on DistilRoberta",
             "type": "debugpy",
             "request": "launch",

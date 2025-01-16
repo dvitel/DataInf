@@ -9,7 +9,7 @@ import random
 
 import argh
 import numpy as np
-from lora_model import build_LORA_model, train_LORA_model, load_pretrained_LORA_model, compute_grads
+from lora_model import build_LORA_model, train_model, selective_train, select_majority_codirected_grad_group, select_pareto_magnitude_grad, load_pretrained_LORA_model, compute_grads
 from influence import IFEngine, compute_hessian_free_influences, compute_datainf_influences, compute_lissa_influences, compute_accurate_influences
 import torch
 from transformers import AutoTokenizer, DataCollatorWithPadding
@@ -184,7 +184,7 @@ def finetune(task = 'mrpc', low_rank = 4,
     lora_model = build_LORA_model(model_name_or_path=model,
                                 target_modules=target_modules, 
                                 low_rank=low_rank)
-    eval_metrics = train_LORA_model(lora_model, train_dataloader, eval_dataloader, device, num_epochs, lr, task)
+    eval_metrics = train_model(lora_model, train_dataloader, eval_dataloader, device, num_epochs, lr, task)
 
     config['finetune'] = convert_metrics(eval_metrics)
     
@@ -207,6 +207,50 @@ def finetune(task = 'mrpc', low_rank = 4,
 
     with torch.no_grad():
         torch.cuda.empty_cache()
+
+
+def finetune_selective(task = 'mrpc', low_rank = 4,
+         device = 'cuda', lr = 3e-4, model = 'roberta-large', batch_size = 8,
+         num_epochs = 10, target_modules = ['value']):
+    ''' Fine tune specific model on specific task and save it to disk for later postprocessing'''
+    config_path = os.path.join(cwd, f'c_{task}_{seed}.json')
+    with open(config_path, 'r') as file:
+        config = json.load(file)
+
+    config.update(low_rank=low_rank, device=device, lr=lr, model=model, batch_size=batch_size,
+                  num_epochs=num_epochs, target_modules=target_modules)
+
+    dataset_path = os.path.join(cwd, f'd_{task}_{seed}')
+    train_dataloader, eval_dataloader, tokenizer = \
+        build_loaders(dataset_path, config['tokenizer_name'], batch_size, val_size = 500)
+
+    lora_model = build_LORA_model(model_name_or_path=model,
+                                target_modules=target_modules, 
+                                low_rank=low_rank)
+    eval_metrics = selective_train(select_majority_codirected_grad_group, lora_model, train_dataloader, eval_dataloader, device, num_epochs, lr, task)
+
+    config['finetune'] = convert_metrics(eval_metrics)
+    
+    with open(config_path, 'w') as file:
+        json.dump(config, file)       
+
+    model_path = os.path.join(cwd, f'm_{task}_{seed}')
+
+    ## next code is for testing weights preservation 
+    # lora_model.to('cpu')
+    # another_lora_model = load_pretrained_LORA_model(model_name_or_path=model_path)
+    # for (name1, param1), (name2, param2) in zip(lora_model.named_parameters(), another_lora_model.named_parameters()):
+    #     if "original_module" not in name1:
+    #         assert torch.allclose(param1, param2, rtol=1e-05, atol=1e-08), f'Parameters are not equal: {name1} {name2}'
+
+    lora_model.save_pretrained(model_path)
+    tokenizer.save_pretrained(model_path)
+
+    del lora_model, train_dataloader, eval_dataloader
+
+    with torch.no_grad():
+        torch.cuda.empty_cache()
+
 
 def grads(task = 'mrpc', no_val = False, return_grads = False, config = None):
     ''' Computes gradients for modules of the model'''
@@ -344,7 +388,7 @@ def finetune2(task = 'mrpc',
     lora_model = build_LORA_model(model_name_or_path=model,
                                 target_modules=target_modules, 
                                 low_rank=config['low_rank'])
-    eval_metrics = train_LORA_model(lora_model, train_dataloader, eval_dataloader, device, num_epochs, lr, task)
+    eval_metrics = train_model(lora_model, train_dataloader, eval_dataloader, device, num_epochs, lr, task)
     metrics = convert_metrics(eval_metrics)
 
     del lora_model, train_dataloader, eval_dataloader
@@ -359,7 +403,7 @@ def finetune2(task = 'mrpc',
         torch.cuda.empty_cache()
 
 parser = argh.ArghParser()
-parser.add_commands([preprocess, finetune, grads, infl, finetune2])
+parser.add_commands([preprocess, finetune, grads, infl, finetune2, finetune_selective])
 
 if __name__ == '__main__':
     parser.dispatch()
